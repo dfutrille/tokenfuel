@@ -1,0 +1,51 @@
+{
+  "min_five_hour": 10,
+  "levels": {
+    "easy": [
+      "opencode-go",
+      "agy-gemini",
+      "codex",
+      "claude"
+    ],
+    "medium": [
+      "codex",
+      "agy-gemini",
+      "claude",
+      "opencode-go"
+    ],
+    "hard": [
+      "claude",
+      "codex",
+      "agy-gemini"
+    ]
+  },
+  "providers": {
+    "claude": {
+      "models": {
+        "easy": [
+          "sonnet"
+        ],
+        "medium": [
+          "sonnet"
+        ],
+        "hard": [
+          "opus"
+        ]
+      }
+    },
+    "opencode-go": {
+      "models": {
+        "easy": [],
+        "medium": [],
+        "hard": []
+      },
+      "notes": {
+        "easy": "Replace empty lists with model IDs available in your plan."
+      }
+    }
+  },
+  "free": {
+    "use": "Review or small changes only",
+    "models": []
+  }
+}

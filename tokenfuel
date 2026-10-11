@@ -1,0 +1,733 @@
+#!/usr/bin/env python3
+"""Subscription quota reporting and provider recommendations; no model calls."""
+
+
+import argparse
+import glob
+import json
+import os
+import select
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+CACHE_DIR = os.path.join(HOME, ".cache", "tokenfuel")
+CLAUDE_DIR = os.path.join(HOME, ".claude")
+AGY_DIR = os.path.join(HOME, ".gemini", "antigravity-cli")
+CODEX_DIR = os.path.join(HOME, ".codex")
+CODEX_SESSIONS = os.path.join(CODEX_DIR, "sessions")
+OPENCODE_AUTH = os.path.join(
+    os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), "opencode", "auth.json"
+)
+PREFS_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "tokenfuel", "preferences.json"
+)
+
+OPENCODE_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
+
+
+STALE_SECS = 30 * 60
+CODEX_FILES_TO_SCAN = 8
+CODEX_TAIL_BYTES = 512 * 1024
+LIVE_TIMEOUT_SECS = 6
+
+LIVE_CACHE_SECS = 60
+
+
+LIVE_VIEW_MIN_SECS = 5
+NOTHING_FOUND = "No Claude Code, Codex, Antigravity CLI or OpenCode Go key detected."
+
+LEVELS = ("easy", "medium", "hard")
+
+DEFAULT_PREFS = {
+
+    "min_five_hour": 10,
+
+    "levels": {
+        "easy": ["opencode-go", "agy-gemini", "agy-claude-gpt", "codex", "claude"],
+        "medium": ["codex", "agy-gemini", "agy-claude-gpt", "claude", "opencode-go"],
+        "hard": ["claude", "codex", "agy-gemini", "agy-claude-gpt", "opencode-go"],
+    },
+    "providers": {},
+    "free": {},
+}
+
+
+GREEN, YELLOW, ORANGE, RED, STRIKE = "32", "33", "38;5;208", "31", "9"
+
+FIVE_HOUR_COLORS = ((60, GREEN), (30, YELLOW), (10, ORANGE))
+
+NAME_COLORS = {
+    "claude": "38;5;173",
+    "codex": "38;5;141",
+    "agy-gemini": "38;5;39",
+    "agy-claude-gpt": "38;5;44",
+}
+
+OPENCODE_NAME_COLORS = ("38;5;205", "38;5;218")
+
+NEARLY_OUT_PERCENT = 5
+
+
+def window(remaining, resets_at=None, seen_at=None, now=None):
+    """Normalize a window; a past reset restores its remaining quota."""
+
+    if remaining is None:
+        return None
+    if resets_at is not None and now is not None and resets_at <= now:
+        return {"remaining": 100.0, "resets_at": None, "seen_at": seen_at, "reset": True}
+    return {
+        "remaining": max(0.0, min(100.0, float(remaining))),
+        "resets_at": resets_at,
+        "seen_at": seen_at,
+        "reset": False,
+    }
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, data):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def read_claude(now):
+    data = read_json(os.path.join(CACHE_DIR, "claude.json")) or {}
+    if not data and not os.path.isdir(CLAUDE_DIR):
+        return []
+
+    def one(key):
+        entry = data.get(key)
+        if not isinstance(entry, dict):
+            return None
+        return window(100 - (entry.get("used_percentage") or 0), entry.get("resets_at"), entry.get("seen_at"), now)
+
+    return [{"name": "claude", "five_hour": one("five_hour"), "week": one("seven_day")}]
+
+
+def parse_iso(text):
+    try:
+        return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+    except (AttributeError, ValueError):
+        return None
+
+
+def read_agy(now):
+    data = read_json(os.path.join(CACHE_DIR, "agy.json")) or {}
+    if not data and not os.path.isdir(AGY_DIR):
+        return []
+    quota = data.get("quota") or {}
+
+    def one(key):
+        entry = quota.get(key)
+        if not isinstance(entry, dict) or entry.get("remaining_fraction") is None:
+            return None
+        return window(entry["remaining_fraction"] * 100, parse_iso(entry.get("reset_time")), entry.get("seen_at"), now)
+
+    return [
+        {"name": "agy-gemini", "five_hour": one("gemini-5h"), "week": one("gemini-weekly")},
+        {"name": "agy-claude-gpt", "five_hour": one("3p-5h"), "week": one("3p-weekly")},
+    ]
+
+
+def last_codex_limits(path):
+
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - CODEX_TAIL_BYTES))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if '"rate_limits":{' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        limits = (event.get("payload") or {}).get("rate_limits")
+        if isinstance(limits, dict):
+            return parse_iso(event.get("timestamp")), limits
+    return None
+
+
+def live_codex_limits(now):
+
+
+    cache_path = os.path.join(CACHE_DIR, "codex.json")
+    cached = read_json(cache_path) or {}
+    if now - cached.get("seen_at", 0) < LIVE_CACHE_SECS:
+        return cached["seen_at"], cached["limits"]
+    binary = shutil.which("codex")
+    if not binary:
+        return None
+    requests = (
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"clientInfo": {"name": "tokenfuel", "title": "tokenfuel", "version": "1.0"}}},
+        {"jsonrpc": "2.0", "method": "initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read"},
+    )
+    try:
+        proc = subprocess.Popen(
+            [binary, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+    except OSError:
+        return None
+    limits = None
+    try:
+        proc.stdin.write("".join(json.dumps(req) + "\n" for req in requests).encode())
+        proc.stdin.flush()
+        deadline = time.monotonic() + LIVE_TIMEOUT_SECS
+        while limits is None and time.monotonic() < deadline:
+            ready, _, _ = select.select([proc.stdout], [], [], max(0, deadline - time.monotonic()))
+            if not ready:
+                break
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if message.get("id") == 2:
+                snapshot = (message.get("result") or {}).get("rateLimits") or {}
+
+                limits = {
+                    key: {
+                        "used_percent": snapshot[key].get("usedPercent"),
+                        "window_minutes": snapshot[key].get("windowDurationMins"),
+                        "resets_at": snapshot[key].get("resetsAt"),
+                    }
+                    for key in ("primary", "secondary")
+                    if isinstance(snapshot.get(key), dict)
+                }
+    except OSError:
+        limits = None
+    finally:
+        proc.kill()
+        proc.wait()
+    if not limits:
+        return None
+    write_json(cache_path, {"seen_at": now, "limits": limits})
+    return now, limits
+
+
+def local_codex_limits():
+
+    files = glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*", "rollout-*.jsonl"))
+    files.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+    found = [hit for hit in map(last_codex_limits, files[:CODEX_FILES_TO_SCAN]) if hit and hit[0]]
+    cached = read_json(os.path.join(CACHE_DIR, "codex.json"))
+    if cached and cached.get("seen_at") and cached.get("limits"):
+        found.append((cached["seen_at"], cached["limits"]))
+    return max(found, key=lambda hit: hit[0]) if found else None
+
+
+def read_codex(now, live=True):
+    if not shutil.which("codex") and not os.path.isdir(CODEX_DIR):
+        return []
+
+
+    hit = (live_codex_limits(now) if live else None) or local_codex_limits()
+    if not hit:
+        return [{"name": "codex", "five_hour": None, "week": None}]
+    seen_at, limits = hit
+    by_minutes = {}
+    for key in ("primary", "secondary"):
+        entry = limits.get(key)
+        if isinstance(entry, dict) and entry.get("used_percent") is not None:
+            by_minutes[entry.get("window_minutes")] = window(
+                100 - entry["used_percent"], entry.get("resets_at"), seen_at, now
+            )
+    return [{"name": "codex", "five_hour": by_minutes.get(300), "week": by_minutes.get(10080)}]
+
+
+def live_opencode_usage(provider_id, key, now, live=True):
+
+
+    cache_path = os.path.join(CACHE_DIR, "opencode.json")
+    cache = read_json(cache_path) or {}
+    cached = cache.get(provider_id) or {}
+    fresh = now - cached.get("seen_at", 0) < LIVE_CACHE_SECS
+    if live and not fresh:
+        request = urllib.request.Request(
+            OPENCODE_USAGE_URL,
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": "tokenfuel/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=LIVE_TIMEOUT_SECS) as response:
+                usage = json.load(response).get("usage")
+        except (OSError, ValueError, AttributeError):
+            usage = None
+        if isinstance(usage, dict):
+            cached = {"seen_at": now, "usage": usage}
+            cache[provider_id] = cached
+            write_json(cache_path, cache)
+    if not cached.get("usage"):
+        return None
+    return cached["seen_at"], cached["usage"]
+
+
+def read_opencode(now, live=True):
+
+    auth = read_json(OPENCODE_AUTH) or {}
+    keys = {
+        provider_id: entry.get("key")
+        for provider_id, entry in sorted(auth.items())
+        if provider_id.startswith("opencode-go") and isinstance(entry, dict) and entry.get("key")
+    }
+    providers = []
+    for provider_id, key in keys.items():
+        hit = live_opencode_usage(provider_id, key, now, live)
+        seen_at, usage = hit if hit else (None, {})
+
+        def one(name):
+            entry = usage.get(name)
+            if not isinstance(entry, dict) or entry.get("percent") is None:
+                return None
+            return window(100 - entry["percent"], parse_iso(entry.get("resetsAt")), seen_at, now)
+
+        providers.append(
+            {"name": provider_id, "five_hour": one("rolling"), "week": one("weekly"), "month": one("monthly")}
+        )
+    return providers
+
+
+def age_text(seen_at, now):
+    if seen_at is None:
+        return ""
+    secs = max(0, now - seen_at)
+    if secs < 90:
+        return "now"
+    if secs < 3600:
+        return f"{secs // 60} min ago"
+    if secs < 48 * 3600:
+        return f"{secs // 3600} h ago"
+    return f"{secs // 86400} d ago"
+
+
+def percent_text(win):
+    if win is None:
+        return "no data"
+    return f"{round(win['remaining'])}%"
+
+
+def exhausted(prov):
+
+    for label, key in (("week", "week"), ("month", "month")):
+        win = prov.get(key)
+        if win and win["remaining"] <= 0:
+            return label, win
+    return None
+
+
+def reset_text(win, now):
+    if win is None or win["resets_at"] is None:
+        return "-"
+    when = datetime.fromtimestamp(win["resets_at"])
+    if when.date() == datetime.fromtimestamp(now).date():
+        return when.strftime("%H:%M")
+    return when.strftime("%d/%m %H:%M")
+
+
+def countdown_text(win, now):
+
+    if win is None or win["resets_at"] is None:
+        return "-"
+    minutes = max(0, win["resets_at"] - now) // 60
+    if minutes >= 24 * 60:
+        return f"{minutes // (24 * 60)}d {minutes % (24 * 60) // 60}h"
+    if minutes >= 60:
+        return f"{minutes // 60}h {minutes % 60}m"
+    return f"{minutes} min"
+
+
+def paint(text, *codes):
+    return f"\033[{';'.join(codes)}m{text}\033[0m"
+
+
+def five_hour_color(win):
+
+    if win is None:
+        return None
+    shown = round(win["remaining"])
+    return next((tone for floor, tone in FIVE_HOUR_COLORS if shown >= floor), RED)
+
+
+def nearly_out(prov):
+
+    return any(win and round(win["remaining"]) < NEARLY_OUT_PERCENT for win in (prov.get("week"), prov.get("month")))
+
+
+def name_colors(providers):
+
+
+    opencode_keys = sorted(prov["name"] for prov in providers if prov["name"] not in NAME_COLORS)
+    colors = dict(NAME_COLORS)
+    for index, name in enumerate(opencode_keys):
+        colors[name] = OPENCODE_NAME_COLORS[index % len(OPENCODE_NAME_COLORS)]
+    return colors
+
+
+def blocking_window(prov):
+    """Return the last weekly/monthly window preventing provider use."""
+
+    blocking = [
+        (label, prov[label])
+        for label in ("week", "month")
+        if prov.get(label) and round(prov[label]["remaining"]) < NEARLY_OUT_PERCENT
+    ]
+    if not blocking:
+        return None
+    return max(blocking, key=lambda item: item[1]["resets_at"] or float("inf"))
+
+
+def stale_age(win, now):
+
+    if win and not win["reset"] and win["seen_at"] is not None and now - win["seen_at"] > STALE_SECS:
+        return age_text(win["seen_at"], now)
+    return ""
+
+
+def by_availability(providers):
+    """Sort usable providers first, then blocked and unknown readings."""
+
+
+    def key(prov):
+        five, week = prov["five_hour"], prov["week"]
+        blocked = blocking_window(prov)
+        if blocked:
+
+            return (1, blocked[1]["resets_at"] or float("inf"), 0)
+        if five is None:
+            return (2, 0, 0)
+        return (0, -round(five["remaining"]), -round(week["remaining"]) if week else 0)
+
+    return sorted(providers, key=key)
+
+
+def use_color(args):
+    if args.no_color or args.json:
+        return False
+    if args.color:
+        return True
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+
+
+def short_line(providers, now, color=False):
+    parts = [f"REMAINING-5H {datetime.fromtimestamp(now):%H:%M}"]
+    name_tones = name_colors(providers)
+    for prov in providers:
+        win = prov["five_hour"]
+        blocked = exhausted(prov)
+        if blocked:
+            label, long_win = blocked
+            back = reset_text(long_win, now)
+            text = f"{prov['name']} 0% ({label} exhausted" + (f", resets {back})" if back != "-" else ")")
+        else:
+            text = f"{prov['name']} {percent_text(win)}"
+        if stale_age(win, now):
+            text += f" ({stale_age(win, now)})"
+        if color:
+            cut = len(prov["name"])
+            name, rest = text[:cut], text[cut:]
+            if nearly_out(prov):
+                text = paint(name, RED, STRIKE) + paint(rest, RED)
+            else:
+                text = paint(name, name_tones[name]) + (paint(rest, five_hour_color(win)) if win else rest)
+        parts.append(text)
+    return " | ".join(parts)
+
+
+def table(providers, now, color=False):
+
+    with_month = any(prov.get("month") for prov in providers)
+    header = ["provider", "5h free", "resets_at", "in", "week free", "resets_at", "in"]
+    if with_month:
+        header += ["month free", "resets_at", "in"]
+    rows = [header + ["data"]]
+    for prov in providers:
+        five, week, month = prov["five_hour"], prov["week"], prov.get("month")
+        row = [prov["name"]]
+        for win in (five, week):
+            row += [percent_text(win), reset_text(win, now), countdown_text(win, now)]
+        if with_month:
+            row += [percent_text(month) if month else "-", reset_text(month, now), countdown_text(month, now)]
+        rows.append(row + [age_text((five or week or {}).get("seen_at"), now) or "-"])
+    widths = [max(len(row[col]) for row in rows) for col in range(len(rows[0]))]
+    lines = ["  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip() for row in rows]
+    if color:
+
+        name_tones = name_colors(providers)
+        for index, prov in enumerate(providers, start=1):
+            line, row = lines[index], rows[index]
+            cut = len(row[0])
+            if nearly_out(prov):
+                lines[index] = paint(line[:cut], RED, STRIKE) + paint(line[cut:], RED)
+                continue
+            start = widths[0] + 2
+            end = start + len(row[1])
+            five = line[start:end]
+            if prov["five_hour"]:
+                five = paint(five, five_hour_color(prov["five_hour"]))
+            lines[index] = paint(line[:cut], name_tones[row[0]]) + line[cut:start] + five + line[end:]
+    return "\n".join(lines)
+
+
+def load_prefs():
+
+    prefs = {**DEFAULT_PREFS, **(read_json(PREFS_PATH) or {})}
+    prefs["levels"] = {**DEFAULT_PREFS["levels"], **(prefs.get("levels") or {})}
+    return prefs
+
+
+def family(name):
+
+    return "opencode-go" if name.startswith("opencode-go") else name
+
+
+def launch_command(name, model):
+
+    if name.startswith("opencode-go"):
+        return f"opencode -m {name}/{model or '<model>'}"
+    binary, flag = {"claude": ("claude", "--model"), "codex": ("codex", "-m")}.get(name, ("agy", "--model"))
+    return f"{binary} {flag} {model}" if model else binary
+
+
+def recommend(providers, level, prefs, now):
+
+
+    order = prefs["levels"][level]
+    minimum = prefs["min_five_hour"]
+    usable, low, emergency, discarded = [], [], [], []
+    for prov in by_availability(providers):
+        name = prov["name"]
+        rules = prefs["providers"].get(family(name)) or {}
+        models = (rules.get("models") or {}).get(level)
+        five, week = prov["five_hour"], prov["week"]
+        if family(name) not in order or models == []:
+            discarded.append({"name": name, "reason": f"excluded for {level} tasks"})
+            continue
+        blocked = blocking_window(prov)
+        if blocked:
+            label, win = blocked
+            back = reset_text(win, now)
+            discarded.append({
+                "name": name,
+                "reason": f"blocked: {label} below {NEARLY_OUT_PERCENT} %"
+                + (f", resets {back}" if back != "-" else "")
+                + "; only if the user explicitly requests this provider",
+            })
+            continue
+        entry = {
+            "name": name,
+            "command": launch_command(name, models[0] if models else None),
+            "models": models or [],
+            "five_hour": round(five["remaining"]) if five else None,
+            "week": round(week["remaining"]) if week else None,
+            "notes": [],
+        }
+        if (rules.get("notes") or {}).get(level):
+            entry["notes"].append(rules["notes"][level])
+        if stale_age(five, now):
+            entry["notes"].append(f"data from {stale_age(five, now)}")
+        short = five is None or entry["five_hour"] < minimum
+        if five is None:
+            entry["notes"].append("no data")
+        elif short:
+            back = reset_text(five, now)
+            entry["notes"].append("low quota" + (f", 5h resets {back}" if back != "-" else ""))
+        if rules.get("emergency_only"):
+            if short:
+                discarded.append({"name": name, "reason": "emergency only, currently low quota"})
+            else:
+                entry["notes"].insert(0, "emergency only")
+                emergency.append(entry)
+        else:
+            (low if short else usable).append(entry)
+
+    def rank(entry):
+        return order.index(family(entry["name"]))
+
+
+    if usable:
+        discarded += [
+            {"name": entry["name"], "reason": "emergency only: use if no recommended provider is suitable"}
+            for entry in emergency
+        ]
+        emergency = []
+    return sorted(usable, key=rank) + sorted(emergency, key=rank) + sorted(low, key=rank), discarded
+
+
+def free_commands(prefs):
+    return [f"opencode -m {model}" for model in (prefs.get("free") or {}).get("models") or []]
+
+
+def best_report(args, now):
+
+    live = not args.local
+    providers = read_claude(now) + read_codex(now, live) + read_agy(now) + read_opencode(now, live)
+    prefs = load_prefs()
+    ranked, discarded = recommend(providers, args.best, prefs, now)
+    ready = [entry for entry in ranked if not any(text.startswith(("low quota", "no data")) for text in entry["notes"])]
+    code = 0 if ready else 1
+    if args.json:
+        data = {"generated": now, "level": args.best, "recommended": ranked, "discarded": discarded}
+        data["free"] = {"use": (prefs.get("free") or {}).get("use"), "commands": free_commands(prefs)}
+        return json.dumps(data, ensure_ascii=False), code
+
+    head = f"BEST-FOR {args.best} {datetime.fromtimestamp(now):%H:%M} · "
+    if ready:
+        lines = [head + "use the first provider"]
+    elif providers:
+        lines = [head + "no provider has enough quota; inform the user"]
+    else:
+        lines = [NOTHING_FOUND]
+    width = max((len(entry["name"]) for entry in ranked), default=0)
+    for number, entry in enumerate(ranked, start=1):
+        quota = "5h " + ("no data" if entry["five_hour"] is None else f"{entry['five_hour']}%")
+        if entry["week"] is not None:
+            quota += f" · week {entry['week']}%"
+        notes = list(entry["notes"])
+        if len(entry["models"]) > 1:
+            notes.append("other models: " + ", ".join(entry["models"][1:]))
+        line = f"{number}. {entry['name'].ljust(width)}  {quota.ljust(22)}  {entry['command']}"
+        lines.append(line + "".join(f"  [{note}]" for note in notes))
+    if discarded:
+        lines.append("Excluded for this task:")
+        reasons = {}
+        for item in discarded:
+            reasons.setdefault(item["reason"], []).append(item["name"])
+        lines += [f"- {', '.join(names)}: {reason}" for reason, names in reasons.items()]
+    if free_commands(prefs):
+        use = (prefs.get("free") or {}).get("use") or "limited use"
+        lines.append(f"Free, without measured quota ({use}): " + " | ".join(free_commands(prefs)))
+    return "\n".join(lines), code
+
+
+def ai_guide(prefs):
+    lines = ["tokenfuel: AI agent guide", "",
+             "Reports remaining subscription quota without using a model. It does not open sessions.",
+             "Before delegation, run tokenfuel --best easy, medium or hard.",
+             "Easy: mechanical changes; medium: bounded features; hard: complex debugging or design.",
+             "Use the first recommended provider and its printed command. Exit 1 means insufficient quota.",
+             "Weekly/monthly quota below 5% blocks a provider unless explicitly requested by the user.",
+             f"Do not start tasks below {prefs['min_five_hour']}% of five-hour quota.",
+             "Follow bracketed notes. Recheck recommendations if a provider runs out.",
+             "Claude and agy readings come from their last use and may be stale.",
+             "Each opencode-go-N represents a separate key. Never print keys.",
+             "Use --local for offline readings, --json for structured output, -v for the full table.",
+             "Do not use --watch in automation: it is interactive and does not exit on its own.",
+             "JSON remaining values are free percentages; resets_at and seen_at are epoch seconds."]
+    for name, rules in (prefs.get("providers") or {}).items():
+        if rules.get("emergency_only"):
+            lines.append(f"{name}: emergency use only.")
+        if rules.get("avoid"):
+            lines.append(f"{name}: avoid {', '.join(rules['avoid'])}.")
+    free = prefs.get("free") or {}
+    if free.get("models"):
+        lines.append(f"Free models: {', '.join(free['models'])}; {free.get('use') or 'limited use'}.")
+    return "\n".join(lines)
+
+
+def level_arg(text):
+    plain = text.lower()
+    if plain not in LEVELS:
+        raise argparse.ArgumentTypeError("specify task difficulty: easy, medium or hard")
+    return plain
+
+
+def report(args, now):
+
+    live = not args.local
+    providers = read_claude(now) + read_codex(now, live) + read_agy(now) + read_opencode(now, live)
+    if args.json:
+        return json.dumps({"generated": now, "providers": providers}, ensure_ascii=False)
+    if not providers:
+        return None
+    providers = by_availability(providers)
+    color = use_color(args)
+    if args.verbose or args.watch:
+        return table(providers, now, color) + "\n" + short_line(providers, now, color)
+    return short_line(providers, now, color)
+
+
+def live_view(args):
+
+    every = max(LIVE_VIEW_MIN_SECS, args.watch)
+    out = sys.stdout
+
+    out.write("\033[?1049h\033[?25l")
+    try:
+        while True:
+            now = int(time.time())
+            head = f"tokenfuel · every {every} s · {datetime.fromtimestamp(now):%H:%M:%S} · Ctrl+C to exit"
+            frame = [head, ""] + (report(args, now) or NOTHING_FOUND).split("\n")
+
+            out.write("\033[H" + "".join(line + "\033[K\n" for line in frame) + "\033[J")
+            out.flush()
+            time.sleep(every)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        out.write("\033[?25h\033[?1049l")
+        out.flush()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Remaining subscription quota by provider.")
+    parser.add_argument("-v", "--verbose", action="store_true", help="table with weekly quota, resets and data age")
+    parser.add_argument("--json", action="store_true", help="JSON output")
+    parser.add_argument("--local", action="store_true", help="skip live queries (offline)")
+    parser.add_argument(
+        "--watch", nargs="?", type=int, const=60, metavar="SECONDS", help="live table, refreshed every minute"
+    )
+    parser.add_argument(
+        "--best", nargs="?", const="", type=level_arg, metavar="LEVEL",
+        help="recommend a provider for easy, medium or hard tasks",
+    )
+    parser.add_argument("--agent-guide", action="store_true", help="usage guide for AI agents")
+    parser.add_argument("--color", action="store_true", help="force terminal colors")
+    parser.add_argument("--no-color", action="store_true", help="disable colors")
+    args = parser.parse_args()
+
+    if args.agent_guide:
+        print(ai_guide(load_prefs()))
+        return 0
+    if args.best is not None:
+        text, code = best_report(args, int(time.time()))
+        print(text)
+        return code
+    if args.watch is not None:
+        if args.json or not sys.stdout.isatty():
+            parser.error("--watch requires a terminal and cannot be combined with --json")
+        return live_view(args)
+    text = report(args, int(time.time()))
+    print(text or NOTHING_FOUND)
+    return 0 if text else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.stdout = open(os.devnull, "w")
+        sys.exit(0)
