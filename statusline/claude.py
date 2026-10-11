@@ -8,7 +8,7 @@ import sys
 import tempfile
 import time
 
-CACHE = os.path.expanduser("~/.cache/tokenfuel/claude.json")
+CACHE = os.path.expanduser("~/.cache/tokenwatch/claude.json")
 WINDOWS = ("five_hour", "seven_day")
 
 SAME_WINDOW_SECS = 120

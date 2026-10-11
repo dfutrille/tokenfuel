@@ -13,8 +13,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~")
 BIN_DIR = os.path.join(HOME, ".local", "bin")
-CACHE_DIR = os.path.join(HOME, ".cache", "tokenfuel")
-STATUSLINE_NAME = "statusline-tokenfuel.py"
+CACHE_DIR = os.path.join(HOME, ".cache", "tokenwatch")
+STATUSLINE_NAME = "statusline-tokenwatch.py"
 
 
 STATUSLINE_TOOLS = (
@@ -106,10 +106,10 @@ def install_statusline(tool):
 
 def install():
     os.makedirs(BIN_DIR, exist_ok=True)
-    target = os.path.join(BIN_DIR, "tokenfuel")
-    shutil.copy2(os.path.join(HERE, "tokenfuel"), target)
+    target = os.path.join(BIN_DIR, "tokenwatch")
+    shutil.copy2(os.path.join(HERE, "tokenwatch"), target)
     os.chmod(target, 0o755)
-    print(f"- tokenfuel installed in {short(target)}.")
+    print(f"- tokenwatch installed in {short(target)}.")
     for tool in STATUSLINE_TOOLS:
         install_statusline(tool)
     if shutil.which("codex") or os.path.isdir(os.path.join(HOME, ".codex")):
@@ -136,22 +136,22 @@ def uninstall():
         script = os.path.join(tool["dir"], STATUSLINE_NAME)
         if os.path.exists(script):
             os.remove(script)
-    target = os.path.join(BIN_DIR, "tokenfuel")
+    target = os.path.join(BIN_DIR, "tokenwatch")
     if os.path.exists(target):
         os.remove(target)
         print(f"- removed {short(target)}.")
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
-    print("- removed cached data in ~/.cache/tokenfuel.")
+    print("- removed cached data in ~/.cache/tokenwatch.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Install or remove tokenfuel.")
-    parser.add_argument("--uninstall", action="store_true", help="remove tokenfuel and its settings")
+    parser = argparse.ArgumentParser(description="Install or remove tokenwatch.")
+    parser.add_argument("--uninstall", action="store_true", help="remove tokenwatch and its settings")
     args = parser.parse_args()
     if os.name == "nt":
-        sys.exit("tokenfuel supports Linux and macOS; use WSL on Windows.")
+        sys.exit("tokenwatch supports Linux and macOS; use WSL on Windows.")
     if sys.version_info < (3, 8):
-        sys.exit("tokenfuel requires Python 3.8 or newer.")
+        sys.exit("tokenwatch requires Python 3.8 or newer.")
     uninstall() if args.uninstall else install()
 
 

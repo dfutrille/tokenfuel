@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime
 
 HOME = os.path.expanduser("~")
-CACHE_DIR = os.path.join(HOME, ".cache", "tokenfuel")
+CACHE_DIR = os.path.join(HOME, ".cache", "tokenwatch")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
 AGY_DIR = os.path.join(HOME, ".gemini", "antigravity-cli")
 CODEX_DIR = os.path.join(HOME, ".codex")
@@ -25,7 +25,7 @@ OPENCODE_AUTH = os.path.join(
     os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), "opencode", "auth.json"
 )
 PREFS_PATH = os.path.join(
-    os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "tokenfuel", "preferences.json"
+    os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "tokenwatch", "preferences.json"
 )
 
 OPENCODE_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
@@ -181,7 +181,7 @@ def live_codex_limits(now):
         return None
     requests = (
         {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-         "params": {"clientInfo": {"name": "tokenfuel", "title": "tokenfuel", "version": "1.0"}}},
+         "params": {"clientInfo": {"name": "tokenwatch", "title": "tokenwatch", "version": "1.0"}}},
         {"jsonrpc": "2.0", "method": "initialized"},
         {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read"},
     )
@@ -270,7 +270,7 @@ def live_opencode_usage(provider_id, key, now, live=True):
     if live and not fresh:
         request = urllib.request.Request(
             OPENCODE_USAGE_URL,
-            headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": "tokenfuel/1.0"},
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": "tokenwatch/1.0"},
         )
         try:
             with urllib.request.urlopen(request, timeout=LIVE_TIMEOUT_SECS) as response:
@@ -624,9 +624,9 @@ def best_report(args, now):
 
 
 def ai_guide(prefs):
-    lines = ["tokenfuel: AI agent guide", "",
+    lines = ["tokenwatch: AI agent guide", "",
              "Reports remaining subscription quota without using a model. It does not open sessions.",
-             "Before delegation, run tokenfuel --best easy, medium or hard.",
+             "Before delegation, run tokenwatch --best easy, medium or hard.",
              "Easy: mechanical changes; medium: bounded features; hard: complex debugging or design.",
              "Use the first recommended provider and its printed command. Exit 1 means insufficient quota.",
              "Weekly/monthly quota below 5% blocks a provider unless explicitly requested by the user.",
@@ -679,7 +679,7 @@ def live_view(args):
     try:
         while True:
             now = int(time.time())
-            head = f"tokenfuel · every {every} s · {datetime.fromtimestamp(now):%H:%M:%S} · Ctrl+C to exit"
+            head = f"tokenwatch · every {every} s · {datetime.fromtimestamp(now):%H:%M:%S} · Ctrl+C to exit"
             frame = [head, ""] + (report(args, now) or NOTHING_FOUND).split("\n")
 
             out.write("\033[H" + "".join(line + "\033[K\n" for line in frame) + "\033[J")

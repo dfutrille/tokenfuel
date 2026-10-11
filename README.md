@@ -1,15 +1,15 @@
-# tokenfuel
+# tokenwatch
 
 See how much subscription quota remains in Claude Code, Codex CLI, Antigravity CLI (`agy`), and OpenCode Go. One executable, Python standard library only. Quota checks do not invoke a model or consume model tokens.
 
 ```bash
-tokenfuel                 # Remaining five-hour quota
-tokenfuel -v              # Full table, reset times and data age
-tokenfuel --json           # Structured output
-tokenfuel --local          # Offline readings only
-tokenfuel --watch 30       # Live table; Ctrl+C to exit
-tokenfuel --best hard      # Recommend a provider: easy, medium or hard
-tokenfuel --agent-guide    # Instructions for AI agents
+tokenwatch                 # Remaining five-hour quota
+tokenwatch -v              # Full table, reset times and data age
+tokenwatch --json           # Structured output
+tokenwatch --local          # Offline readings only
+tokenwatch --watch 30       # Live table; Ctrl+C to exit
+tokenwatch --best hard      # Recommend a provider: easy, medium or hard
+tokenwatch --agent-guide    # Instructions for AI agents
 ```
 
 ## Installation
@@ -17,8 +17,8 @@ tokenfuel --agent-guide    # Instructions for AI agents
 Linux or macOS, Python 3.8+. Windows users can use WSL. macOS and older Python runtimes have not been tested; Python 3.8 syntax compatibility is checked automatically.
 
 ```bash
-git clone https://github.com/dfutrille/tokenfuel.git
-cd tokenfuel
+git clone https://github.com/dfutrille/tokenwatch.git
+cd tokenwatch
 python3 install.py
 ```
 
@@ -31,8 +31,8 @@ export PATH="$HOME/.local/bin:$PATH"
 Claude and agy show `no data` until a session sends quota to the collector. If you already use a custom status line, run the installed collector with the same JSON on stdin:
 
 ```bash
-~/.claude/statusline-tokenfuel.py --save-only
-# For agy: ~/.gemini/antigravity-cli/statusline-tokenfuel.py
+~/.claude/statusline-tokenwatch.py --save-only
+# For agy: ~/.gemini/antigravity-cli/statusline-tokenwatch.py
 ```
 
 The agy collector never prints output. The Claude collector normally prints model and remaining quota. Installation does not modify global agent instructions or preferences.
@@ -41,7 +41,7 @@ The agy collector never prints output. The Claude collector normally prints mode
 python3 install.py --uninstall
 ```
 
-Uninstallation removes tokenfuel, its collectors, its own status-line settings, and its cache. It preserves unrelated settings and preferences.
+Uninstallation removes tokenwatch, its collectors, its own status-line settings, and its cache. It preserves unrelated settings and preferences.
 
 ## Reading the output
 
@@ -56,8 +56,8 @@ Five-hour colors: green at 60%+, yellow at 30%+, orange at 10%+, red below 10%. 
 `--best LEVEL` prints a ranked list and suggested launch commands. It only informs: it does not launch agents or change their configuration. Exit status 1 means no recommended provider has enough known quota. Blocked providers are excluded. Low or unknown five-hour readings move to the end; emergency providers appear when no regular provider has enough quota. Multiple OpenCode keys share family preferences and sort by availability.
 
 ```bash
-mkdir -p ~/.config/tokenfuel
-cp examples/preferences.json ~/.config/tokenfuel/preferences.json
+mkdir -p ~/.config/tokenwatch
+cp examples/preferences.json ~/.config/tokenwatch/preferences.json
 ```
 
 The example is generic; choose model IDs supported by your installed tools and plan. Empty model lists exclude a provider for that level. Without preferences, recommendations use a generic order without specifying models.
@@ -74,7 +74,7 @@ The example is generic; choose model IDs supported by your installed tools and p
 
 Add this to your agents' global instructions if desired:
 
-> Before opening a session in another AI tool or delegating work, run `tokenfuel --agent-guide` and follow its provider and model selection instructions. This command does not consume model tokens.
+> Before opening a session in another AI tool or delegating work, run `tokenwatch --agent-guide` and follow its provider and model selection instructions. This command does not consume model tokens.
 
 ## OpenCode Go and multiple keys
 
@@ -89,8 +89,8 @@ This helper changes OpenCode configuration only when explicitly run. It backs up
 
 ## Sources, privacy and limitations
 
-- Claude Code: limits received by its status line, saved in `~/.cache/tokenfuel/claude.json`.
-- agy: quota received by its status line, saved in `~/.cache/tokenfuel/agy.json`.
+- Claude Code: limits received by its status line, saved in `~/.cache/tokenwatch/claude.json`.
+- agy: quota received by its status line, saved in `~/.cache/tokenwatch/agy.json`.
 - Codex: `codex app-server` reads account limits; falls back to the latest local session readings and cached results.
 - OpenCode Go: reads connected keys from the local OpenCode auth file and sends each key only to `https://opencode.ai/zen/go/v1/usage`. This endpoint is undocumented and may change.
 

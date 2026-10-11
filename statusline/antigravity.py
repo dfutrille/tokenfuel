@@ -9,7 +9,7 @@ import tempfile
 import time
 from datetime import datetime
 
-CACHE = os.path.expanduser("~/.cache/tokenfuel/agy.json")
+CACHE = os.path.expanduser("~/.cache/tokenwatch/agy.json")
 
 SAME_WINDOW_SECS = 120
 

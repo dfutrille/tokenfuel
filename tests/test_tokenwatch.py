@@ -22,7 +22,7 @@ def load(name, path):
     return module
 
 
-app = load('tokenfuel', ROOT / 'tokenfuel')
+app = load('tokenwatch', ROOT / 'tokenwatch')
 claude = load('claude_status', ROOT / 'statusline/claude.py')
 agy = load('agy_status', ROOT / 'statusline/antigravity.py')
 clone = load('clone_go', ROOT / 'tools/clone-opencode-go.py')
@@ -72,7 +72,7 @@ class QuotaTests(unittest.TestCase):
         self.assertEqual(agy.merge_bucket(old, {'remaining_fraction': .8, 'reset_time': old['reset_time']}, 1000), old)
 
     def test_python38_syntax(self):
-        for path in [ROOT / 'tokenfuel', ROOT / 'install.py', *ROOT.glob('statusline/*.py'), *ROOT.glob('tools/*.py')]:
+        for path in [ROOT / 'tokenwatch', ROOT / 'install.py', *ROOT.glob('statusline/*.py'), *ROOT.glob('tools/*.py')]:
             ast.parse(path.read_text(), feature_version=(3, 8))
 
     def test_opencode_offline_never_contacts_endpoint(self):
@@ -112,7 +112,7 @@ class QuotaTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(settings.read_text()), original)
             self.assertEqual(json.loads(agy_settings.read_text()), {'other': True})
-            self.assertFalse((Path(home) / '.local/bin/tokenfuel').exists())
+            self.assertFalse((Path(home) / '.local/bin/tokenwatch').exists())
 
 
 if __name__ == '__main__':
