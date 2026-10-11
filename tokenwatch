@@ -635,7 +635,7 @@ def ai_guide(prefs):
              "Claude and agy readings come from their last use and may be stale.",
              "Each opencode-go-N represents a separate key. Never print keys.",
              "Use --local for offline readings, --json for structured output, -v for the full table.",
-             "Do not use --watch in automation: it is interactive and does not exit on its own.",
+             "Do not use --live in automation: it is interactive and does not exit on its own.",
              "JSON remaining values are free percentages; resets_at and seen_at are epoch seconds."]
     for name, rules in (prefs.get("providers") or {}).items():
         if rules.get("emergency_only"):
@@ -665,14 +665,14 @@ def report(args, now):
         return None
     providers = by_availability(providers)
     color = use_color(args)
-    if args.verbose or args.watch:
+    if args.verbose or args.live:
         return table(providers, now, color) + "\n" + short_line(providers, now, color)
     return short_line(providers, now, color)
 
 
 def live_view(args):
 
-    every = max(LIVE_VIEW_MIN_SECS, args.watch)
+    every = max(LIVE_VIEW_MIN_SECS, args.live)
     out = sys.stdout
 
     out.write("\033[?1049h\033[?25l")
@@ -698,7 +698,7 @@ def main():
     parser.add_argument("--json", action="store_true", help="JSON output")
     parser.add_argument("--local", action="store_true", help="skip live queries (offline)")
     parser.add_argument(
-        "--watch", nargs="?", type=int, const=60, metavar="SECONDS", help="live table, refreshed every minute"
+        "--live", nargs="?", type=int, const=60, metavar="SECONDS", help="live table, refreshed every minute"
     )
     parser.add_argument(
         "--best", nargs="?", const="", type=level_arg, metavar="LEVEL",
@@ -716,9 +716,9 @@ def main():
         text, code = best_report(args, int(time.time()))
         print(text)
         return code
-    if args.watch is not None:
+    if args.live is not None:
         if args.json or not sys.stdout.isatty():
-            parser.error("--watch requires a terminal and cannot be combined with --json")
+            parser.error("--live requires a terminal and cannot be combined with --json")
         return live_view(args)
     text = report(args, int(time.time()))
     print(text or NOTHING_FOUND)

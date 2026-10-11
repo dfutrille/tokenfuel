@@ -7,7 +7,7 @@ tokenwatch                 # Remaining five-hour quota
 tokenwatch -v              # Full table, reset times and data age
 tokenwatch --json           # Structured output
 tokenwatch --local          # Offline readings only
-tokenwatch --watch 30       # Live table; Ctrl+C to exit
+tokenwatch --live 30       # Live table; Ctrl+C to exit
 tokenwatch --best hard      # Recommend a provider: easy, medium or hard
 tokenwatch --agent-guide    # Instructions for AI agents
 ```
@@ -49,7 +49,7 @@ Percentages show quota **remaining**. The full table includes five-hour, weekly,
 
 Rows sort by available five-hour quota, then weekly quota. Providers with weekly or monthly quota below 5% sort below usable providers, by reset time. Unknown readings come last. JSON uses a fixed provider order.
 
-Five-hour colors: green at 60%+, yellow at 30%+, orange at 10%+, red below 10%. A red row with a crossed-out name indicates a weekly/monthly block. Provider name colors identify providers. Colors require a terminal unless `--color` is used; `--no-color` and `NO_COLOR` disable automatic colors. JSON never includes colors. `--watch` uses an alternate terminal screen and restores it on Ctrl+C.
+Five-hour colors: green at 60%+, yellow at 30%+, orange at 10%+, red below 10%. A red row with a crossed-out name indicates a weekly/monthly block. Provider name colors identify providers. Colors require a terminal unless `--color` is used; `--no-color` and `NO_COLOR` disable automatic colors. JSON never includes colors. `--live` uses an alternate terminal screen and restores it on Ctrl+C.
 
 ## Recommendations and preferences
 
