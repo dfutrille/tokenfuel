@@ -311,6 +311,27 @@ def read_opencode(now, live=True):
     return providers
 
 
+def read_opencode_paid():
+    """OpenCode providers connected with a pay-per-use API key; no quota to measure."""
+
+    auth = read_json(OPENCODE_AUTH) or {}
+    return [
+        {"name": f"opencode-{provider_id}", "command": f"opencode -m {provider_id}/<model>"}
+        for provider_id, entry in sorted(auth.items())
+        if not provider_id.startswith("opencode-go")
+        and isinstance(entry, dict) and entry.get("type") == "api" and entry.get("key")
+    ]
+
+
+PAID_USE = "only if the user explicitly requests it"
+PAID_NOTE = f"pay per use, no measured quota; {PAID_USE}"
+
+
+def paid_lines(paid):
+    width = max((len(prov["name"]) for prov in paid), default=0)
+    return [f"{prov['name'].ljust(width)}  {PAID_NOTE}" for prov in paid]
+
+
 def age_text(seen_at, now):
     if seen_at is None:
         return ""
@@ -592,6 +613,7 @@ def best_report(args, now):
     if args.json:
         data = {"generated": now, "level": args.best, "recommended": ranked, "discarded": discarded}
         data["free"] = {"use": (prefs.get("free") or {}).get("use"), "commands": free_commands(prefs)}
+        data["pay_per_use"] = read_opencode_paid()
         return json.dumps(data, ensure_ascii=False), code
 
     head = f"BEST-FOR {args.best} {datetime.fromtimestamp(now):%H:%M} · "
@@ -620,6 +642,9 @@ def best_report(args, now):
     if free_commands(prefs):
         use = (prefs.get("free") or {}).get("use") or "limited use"
         lines.append(f"Free, without measured quota ({use}): " + " | ".join(free_commands(prefs)))
+    paid = read_opencode_paid()
+    if paid:
+        lines.append(f"Pay per use, {PAID_USE}: " + " | ".join(prov["command"] for prov in paid))
     return "\n".join(lines), code
 
 
@@ -645,6 +670,8 @@ def ai_guide(prefs):
     free = prefs.get("free") or {}
     if free.get("models"):
         lines.append(f"Free models: {', '.join(free['models'])}; {free.get('use') or 'limited use'}.")
+    for prov in read_opencode_paid():
+        lines.append(f"{prov['name']}: {PAID_NOTE} ({prov['command']}).")
     return "\n".join(lines)
 
 
@@ -659,14 +686,15 @@ def report(args, now):
 
     live = not args.local
     providers = read_claude(now) + read_codex(now, live) + read_agy(now) + read_opencode(now, live)
+    paid = read_opencode_paid()
     if args.json:
-        return json.dumps({"generated": now, "providers": providers}, ensure_ascii=False)
+        return json.dumps({"generated": now, "providers": providers, "pay_per_use": paid}, ensure_ascii=False)
     if not providers:
         return None
     providers = by_availability(providers)
     color = use_color(args)
     if args.verbose or args.live:
-        return table(providers, now, color) + "\n" + short_line(providers, now, color)
+        return "\n".join([table(providers, now, color)] + paid_lines(paid) + [short_line(providers, now, color)])
     return short_line(providers, now, color)
 
 

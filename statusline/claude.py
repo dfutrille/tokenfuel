@@ -13,6 +13,9 @@ WINDOWS = ("five_hour", "seven_day")
 
 SAME_WINDOW_SECS = 120
 
+# A drop this large within one window is a reset or plan upgrade, not a stale session.
+RESET_DROP_PERCENT = 10
+
 
 def load_cache():
     try:
@@ -52,7 +55,8 @@ def merge_window(old, new, now):
         return new
     if delta < -SAME_WINDOW_SECS:
         return old
-    if new["used_percentage"] >= (old.get("used_percentage") or 0):
+    old_used = old.get("used_percentage") or 0
+    if new["used_percentage"] >= old_used or old_used - new["used_percentage"] >= RESET_DROP_PERCENT:
         return new
     return old
 

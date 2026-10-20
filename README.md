@@ -87,16 +87,19 @@ python3 tools/clone-opencode-go.py --id opencode-go-2
 
 This helper changes OpenCode configuration only when explicitly run. It backs up existing configuration and refuses an existing provider ID. Connect the new key inside OpenCode via `/connect` → Other → the new ID, or use the environment variable printed by the helper. Keys are never passed as command-line arguments. Re-run with a new ID when you need another provider. Plain JSON configuration is required.
 
+Other providers connected in OpenCode with an API key (for example `anthropic`) are pay per use and have no quota windows. They appear as an informational `opencode-<id>` line in `-v`, `--best`, `--agent-guide` and as `pay_per_use` in `--json`, and are never recommended automatically.
+
 ## Sources, privacy and limitations
 
 - Claude Code: limits received by its status line, saved in `~/.cache/tokenwatch/claude.json`.
 - agy: quota received by its status line, saved in `~/.cache/tokenwatch/agy.json`.
 - Codex: `codex app-server` reads account limits; falls back to the latest local session readings and cached results.
+- OpenCode pay-per-use providers: only the provider IDs and key type are read from the same auth file; the keys are neither read into output nor sent anywhere.
 - OpenCode Go: reads connected keys from the local OpenCode auth file and sends each key only to `https://opencode.ai/zen/go/v1/usage`. This endpoint is undocumented and may change.
 
 No telemetry or third-party analytics are included. Credentials are not printed or copied into the repository. Codex uses its existing signed-in session. Cached quota responses stay on your machine. Live queries have a six-second timeout and are reused for 60 seconds. `--local` skips live queries. Claude/agy readings can be stale; API-key billing may not expose subscription windows. Provider protocol changes may require updates.
 
-Collectors merge readings from multiple sessions conservatively: within the same window, the most consumed reading wins; across windows, the later reset wins. Collectors use atomic file replacement, but simultaneous read/merge/write operations are not locked. Wide tables may wrap in narrow terminals; orange requires 256-color support.
+Collectors merge readings from multiple sessions conservatively: within the same window, the most consumed reading wins unless usage drops by 10 points or more (a reset or plan upgrade); across windows, the later reset wins. Collectors use atomic file replacement, but simultaneous read/merge/write operations are not locked. Wide tables may wrap in narrow terminals; orange requires 256-color support.
 
 ## Development
 

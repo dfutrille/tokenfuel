@@ -13,6 +13,9 @@ CACHE = os.path.expanduser("~/.cache/tokenwatch/agy.json")
 
 SAME_WINDOW_SECS = 120
 
+# A rise this large within one window is a reset or plan upgrade, not a stale session.
+RESET_RISE_FRACTION = 0.10
+
 
 def reset_epoch(entry):
     try:
@@ -34,7 +37,8 @@ def merge_bucket(old, new, now):
         return new
     if delta < -SAME_WINDOW_SECS:
         return old
-    if new["remaining_fraction"] <= old.get("remaining_fraction", 1):
+    old_remaining = old.get("remaining_fraction", 1)
+    if new["remaining_fraction"] <= old_remaining or new["remaining_fraction"] - old_remaining >= RESET_RISE_FRACTION:
         return new
     return old
 

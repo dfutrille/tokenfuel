@@ -66,10 +66,16 @@ class QuotaTests(unittest.TestCase):
 
     def test_collectors_merge_conservatively(self):
         old = {'used_percentage': 80, 'resets_at': 2000, 'seen_at': 900}
-        self.assertEqual(claude.merge_window(old, {'used_percentage': 20, 'resets_at': 2001}, 1000), old)
+        self.assertEqual(claude.merge_window(old, {'used_percentage': 75, 'resets_at': 2001}, 1000), old)
         self.assertEqual(claude.merge_window(old, {'used_percentage': 0, 'resets_at': 4000}, 1000)['used_percentage'], 0)
         old = {'remaining_fraction': .2, 'reset_time': '2030-01-01T00:00:00Z'}
-        self.assertEqual(agy.merge_bucket(old, {'remaining_fraction': .8, 'reset_time': old['reset_time']}, 1000), old)
+        self.assertEqual(agy.merge_bucket(old, {'remaining_fraction': .25, 'reset_time': old['reset_time']}, 1000), old)
+
+    def test_collectors_accept_reset_within_same_window(self):
+        old = {'used_percentage': 97, 'resets_at': 2000, 'seen_at': 900}
+        self.assertEqual(claude.merge_window(old, {'used_percentage': 0, 'resets_at': 2000}, 1000)['used_percentage'], 0)
+        old = {'remaining_fraction': .03, 'reset_time': '2030-01-01T00:00:00Z'}
+        self.assertEqual(agy.merge_bucket(old, {'remaining_fraction': 1, 'reset_time': old['reset_time']}, 1000)['remaining_fraction'], 1)
 
     def test_python38_syntax(self):
         for path in [ROOT / 'tokenwatch', ROOT / 'install.py', *ROOT.glob('statusline/*.py'), *ROOT.glob('tools/*.py')]:
@@ -84,6 +90,18 @@ class QuotaTests(unittest.TestCase):
                 rows = app.read_opencode(1000, live=False)
             self.assertEqual(rows[0]['name'], 'opencode-go')
             self.assertIsNone(rows[0]['five_hour'])
+
+    def test_opencode_paid_lists_api_keys_only(self):
+        with tempfile.TemporaryDirectory() as home:
+            auth = Path(home) / 'auth.json'
+            auth.write_text(json.dumps({'opencode-go': {'type': 'api', 'key': 'synthetic-go'},
+                                        'anthropic': {'type': 'api', 'key': 'synthetic-test-key'},
+                                        'openai': {'type': 'oauth', 'access': 'synthetic-token'},
+                                        'empty': {'type': 'api', 'key': ''}}))
+            with patch.object(app, 'OPENCODE_AUTH', str(auth)):
+                paid = app.read_opencode_paid()
+        self.assertEqual(paid, [{'name': 'opencode-anthropic', 'command': 'opencode -m anthropic/<model>'}])
+        self.assertNotIn('synthetic', json.dumps(paid))
 
     def test_clone_refuses_existing_provider(self):
         model = {'id': 'example-model', 'api': {'url': 'https://opencode.ai/zen/go/v1', 'npm': '@ai-sdk/openai-compatible'}}
