@@ -4,10 +4,12 @@
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import select
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -24,6 +26,7 @@ CODEX_SESSIONS = os.path.join(CODEX_DIR, "sessions")
 OPENCODE_AUTH = os.path.join(
     os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), "opencode", "auth.json"
 )
+OPENCODE_DB = os.path.join(os.path.dirname(OPENCODE_AUTH), "opencode.db")
 PREFS_PATH = os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "tokenwatch", "preferences.json"
 )
@@ -60,6 +63,8 @@ DEFAULT_PREFS = {
 
 GREEN, YELLOW, ORANGE, RED, STRIKE = "32", "33", "38;5;208", "31", "9"
 
+GRAY = "38;5;242"
+
 FIVE_HOUR_COLORS = ((60, GREEN), (30, YELLOW), (10, ORANGE))
 
 NAME_COLORS = {
@@ -72,6 +77,10 @@ NAME_COLORS = {
 OPENCODE_NAME_COLORS = ("38;5;205", "38;5;218")
 
 NEARLY_OUT_PERCENT = 5
+
+FIVE_HOUR_SECS = 5 * 3600
+
+UNSTARTED_MARGIN_SECS = 120
 
 
 def window(remaining, resets_at=None, seen_at=None, now=None):
@@ -272,18 +281,30 @@ def live_opencode_usage(provider_id, key, now, live=True):
             OPENCODE_USAGE_URL,
             headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": "tokenwatch/1.0"},
         )
+        error = None
         try:
             with urllib.request.urlopen(request, timeout=LIVE_TIMEOUT_SECS) as response:
                 usage = json.load(response).get("usage")
+        except urllib.error.HTTPError as http_error:
+            usage = None
+            if http_error.code == 401:
+                error = "key rejected"
+                try:
+                    if (json.load(http_error).get("error") or {}).get("code") == "api_key_expired":
+                        error = "key expired"
+                except (OSError, ValueError, AttributeError):
+                    pass
         except (OSError, ValueError, AttributeError):
             usage = None
-        if isinstance(usage, dict):
-            cached = {"seen_at": now, "usage": usage}
+        if isinstance(usage, dict) or error:
+            cached = {"seen_at": now, "usage": usage} if isinstance(usage, dict) else {"seen_at": now, "error": error}
             cache[provider_id] = cached
             write_json(cache_path, cache)
+    if cached.get("error"):
+        return cached["seen_at"], None, cached["error"]
     if not cached.get("usage"):
         return None
-    return cached["seen_at"], cached["usage"]
+    return cached["seen_at"], cached["usage"], None
 
 
 def read_opencode(now, live=True):
@@ -297,7 +318,8 @@ def read_opencode(now, live=True):
     providers = []
     for provider_id, key in keys.items():
         hit = live_opencode_usage(provider_id, key, now, live)
-        seen_at, usage = hit if hit else (None, {})
+        seen_at, usage, error = hit if hit else (None, None, None)
+        usage = usage or {}
 
         def one(name):
             entry = usage.get(name)
@@ -305,31 +327,105 @@ def read_opencode(now, live=True):
                 return None
             return window(100 - entry["percent"], parse_iso(entry.get("resetsAt")), seen_at, now)
 
-        providers.append(
-            {"name": provider_id, "five_hour": one("rolling"), "week": one("weekly"), "month": one("monthly")}
-        )
+        prov = {"name": provider_id, "five_hour": one("rolling"), "week": one("weekly"), "month": one("monthly")}
+        if error:
+            prov["error"] = error
+        providers.append(prov)
     return providers
 
 
-def read_opencode_paid():
-    """OpenCode providers connected with a pay-per-use API key; no quota to measure."""
+def opencode_spent(provider_id, since):
+    """Dollars OpenCode recorded for a provider's replies since an epoch; None if unreadable."""
+
+    try:
+        db = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True, timeout=LIVE_TIMEOUT_SECS)
+        try:
+            row = db.execute(
+                "SELECT sum(json_extract(data, '$.cost')) FROM message WHERE time_created >= ?"
+                " AND json_extract(data, '$.providerID') = ? AND json_extract(data, '$.role') = 'assistant'",
+                (since * 1000, provider_id),
+            ).fetchone()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return None
+    return round(row[0] or 0.0, 4)
+
+
+def paid_since(provider_id, key, now):
+    """When the current key was first seen; only a fingerprint of the key is cached."""
+
+    cache_path = os.path.join(CACHE_DIR, "paid.json")
+    cache = read_json(cache_path) or {}
+    fingerprint = hashlib.sha256(key.encode()).hexdigest()[:16]
+    seen = cache.get(provider_id)
+    if not isinstance(seen, dict) or seen.get("key") != fingerprint:
+        # The first key seen owns the whole OpenCode history; a replacement starts from now.
+        seen = {"key": fingerprint, "since": now if isinstance(seen, dict) else 0}
+        cache[provider_id] = seen
+        write_json(cache_path, cache)
+    return seen["since"]
+
+
+def read_opencode_paid(now, prefs):
+    """OpenCode providers connected with a pay-per-use API key, with their spend in the current period."""
 
     auth = read_json(OPENCODE_AUTH) or {}
-    return [
-        {"name": f"opencode-{provider_id}", "command": f"opencode -m {provider_id}/<model>"}
-        for provider_id, entry in sorted(auth.items())
-        if not provider_id.startswith("opencode-go")
-        and isinstance(entry, dict) and entry.get("type") == "api" and entry.get("key")
-    ]
+    paid = []
+    for provider_id, entry in sorted(auth.items()):
+        if provider_id.startswith("opencode-go") or not isinstance(entry, dict):
+            continue
+        if entry.get("type") != "api" or not entry.get("key"):
+            continue
+        name = f"opencode-{provider_id}"
+        rules = prefs["providers"].get(name) or {}
+        since = paid_since(provider_id, entry["key"], now)
+        expires = parse_iso(rules.get("expires"))
+        expired = expires is not None and expires <= now
+        if expired:
+            # An expired key restarts the count on its expiry date.
+            since = max(since, expires)
+        paid.append({
+            "name": name, "command": f"opencode -m {provider_id}/<model>",
+            "spent": opencode_spent(provider_id, since), "budget": rules.get("budget_usd"),
+            "since": since or None, "expires": expires, "expired": expired,
+        })
+    return paid
 
 
 PAID_USE = "only if the user explicitly requests it"
-PAID_NOTE = f"pay per use, no measured quota; {PAID_USE}"
+PAID_NOTE = f"pay per use; {PAID_USE}"
 
 
-def paid_lines(paid):
+def money(amount):
+    return f"${amount:.2f}"
+
+
+def spend_text(prov):
+    if prov["spent"] is None:
+        return "spend unknown"
+    if not prov["budget"]:
+        return f"{money(prov['spent'])} spent"
+    left = prov["budget"] - prov["spent"]
+    if left <= 0:
+        return f"{money(prov['spent'])} of ${prov['budget']:g} spent, budget exhausted"
+    return f"{money(prov['spent'])} of ${prov['budget']:g} spent, {money(left)} left"
+
+
+def paid_text(prov, now):
+    parts = [spend_text(prov)]
+    if prov["expires"] is not None:
+        day = f"{datetime.fromtimestamp(prov['expires']):%Y-%m-%d}"
+        if prov["expired"]:
+            parts.append(f"key expired {day}")
+        else:
+            parts.append(f"key expires {day} (in {countdown_text({'resets_at': prov['expires']}, now)})")
+    return " · ".join(parts) + f"; {PAID_NOTE}"
+
+
+def paid_lines(paid, now):
     width = max((len(prov["name"]) for prov in paid), default=0)
-    return [f"{prov['name'].ljust(width)}  {PAID_NOTE}" for prov in paid]
+    return [f"{prov['name'].ljust(width)}  {paid_text(prov, now)}" for prov in paid]
 
 
 def age_text(seen_at, now):
@@ -358,6 +454,15 @@ def exhausted(prov):
         if win and win["remaining"] <= 0:
             return label, win
     return None
+
+
+def unstarted(win, now):
+    """Full five-hour window whose reset is a full window away: no usage yet, no real reset."""
+
+    return (
+        win is not None and win["remaining"] >= 100 and win["resets_at"] is not None
+        and win["resets_at"] - now >= FIVE_HOUR_SECS - UNSTARTED_MARGIN_SECS
+    )
 
 
 def reset_text(win, now):
@@ -395,6 +500,8 @@ def five_hour_color(win):
 
 def nearly_out(prov):
 
+    if prov.get("error"):
+        return True
     return any(win and round(win["remaining"]) < NEARLY_OUT_PERCENT for win in (prov.get("week"), prov.get("month")))
 
 
@@ -459,7 +566,9 @@ def short_line(providers, now, color=False):
     for prov in providers:
         win = prov["five_hour"]
         blocked = exhausted(prov)
-        if blocked:
+        if prov.get("error"):
+            text = f"{prov['name']} {prov['error']}"
+        elif blocked:
             label, long_win = blocked
             back = reset_text(long_win, now)
             text = f"{prov['name']} 0% ({label} exhausted" + (f", resets {back})" if back != "-" else ")")
@@ -485,31 +594,50 @@ def table(providers, now, color=False):
     if with_month:
         header += ["month free", "resets_at", "in"]
     rows = [header + ["data"]]
+    failed = [prov for prov in providers if prov.get("error")]
+    providers = [prov for prov in providers if not prov.get("error")]
     for prov in providers:
         five, week, month = prov["five_hour"], prov["week"], prov.get("month")
         row = [prov["name"]]
-        for win in (five, week):
-            row += [percent_text(win), reset_text(win, now), countdown_text(win, now)]
+        if unstarted(five, now):
+            row += [percent_text(five), "-", "-"]
+        else:
+            row += [percent_text(five), reset_text(five, now), countdown_text(five, now)]
+        row += [percent_text(week), reset_text(week, now), countdown_text(week, now)]
         if with_month:
             row += [percent_text(month) if month else "-", reset_text(month, now), countdown_text(month, now)]
-        rows.append(row + [age_text((five or week or {}).get("seen_at"), now) or "-"])
+        rows.append(row + [prov.get("error") or age_text((five or week or {}).get("seen_at"), now) or "-"])
     widths = [max(len(row[col]) for row in rows) for col in range(len(rows[0]))]
-    lines = ["  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip() for row in rows]
+    tones = [[()] * len(row) for row in rows]
     if color:
-
         name_tones = name_colors(providers)
-        for index, prov in enumerate(providers, start=1):
-            line, row = lines[index], rows[index]
-            cut = len(row[0])
-            if nearly_out(prov):
-                lines[index] = paint(line[:cut], RED, STRIKE) + paint(line[cut:], RED)
+        for prov, row_tones in zip(providers, tones[1:]):
+            if not nearly_out(prov):
+                row_tones[0] = (name_tones[prov["name"]],)
+                if prov["five_hour"]:
+                    row_tones[1] = (five_hour_color(prov["five_hour"]),)
                 continue
-            start = widths[0] + 2
-            end = start + len(row[1])
-            five = line[start:end]
-            if prov["five_hour"]:
-                five = paint(five, five_hour_color(prov["five_hour"]))
-            lines[index] = paint(line[:cut], name_tones[row[0]]) + line[cut:start] + five + line[end:]
+            # Only the exhausted windows stay red; everything else is irrelevant while blocked.
+            row_tones[:] = [(GRAY,)] * len(row_tones)
+            row_tones[0] = (RED, STRIKE)
+            for start, key in ((4, "week"), (7, "month")):
+                win = prov.get(key)
+                if win and round(win["remaining"]) < NEARLY_OUT_PERCENT:
+                    row_tones[start:start + 3] = [(RED,)] * 3
+
+    def cell(text, width, codes, last):
+        pad = "" if last else " " * (width - len(text))
+        return (paint(text, *codes) if codes else text) + pad
+
+    lines = [
+        "  ".join(cell(text, width, codes, col == len(row) - 1)
+                  for col, (text, width, codes) in enumerate(zip(row, widths, row_tones)))
+        for row, row_tones in zip(rows, tones)
+    ]
+    for prov in failed:
+        name = prov["name"]
+        rest = " " * (widths[0] - len(name)) + f"  {prov['error']}; replace it in OpenCode"
+        lines.append(paint(name, RED, STRIKE) + paint(rest, RED) if color else name + rest)
     return "\n".join(lines)
 
 
@@ -546,6 +674,9 @@ def recommend(providers, level, prefs, now):
         five, week = prov["five_hour"], prov["week"]
         if family(name) not in order or models == []:
             discarded.append({"name": name, "reason": f"excluded for {level} tasks"})
+            continue
+        if prov.get("error"):
+            discarded.append({"name": name, "reason": f"{prov['error']}; the user must replace it in OpenCode"})
             continue
         blocked = blocking_window(prov)
         if blocked:
@@ -613,7 +744,7 @@ def best_report(args, now):
     if args.json:
         data = {"generated": now, "level": args.best, "recommended": ranked, "discarded": discarded}
         data["free"] = {"use": (prefs.get("free") or {}).get("use"), "commands": free_commands(prefs)}
-        data["pay_per_use"] = read_opencode_paid()
+        data["pay_per_use"] = read_opencode_paid(now, prefs)
         return json.dumps(data, ensure_ascii=False), code
 
     head = f"BEST-FOR {args.best} {datetime.fromtimestamp(now):%H:%M} · "
@@ -642,13 +773,15 @@ def best_report(args, now):
     if free_commands(prefs):
         use = (prefs.get("free") or {}).get("use") or "limited use"
         lines.append(f"Free, without measured quota ({use}): " + " | ".join(free_commands(prefs)))
-    paid = read_opencode_paid()
+    paid = read_opencode_paid(now, prefs)
     if paid:
-        lines.append(f"Pay per use, {PAID_USE}: " + " | ".join(prov["command"] for prov in paid))
+        lines.append(
+            f"Pay per use, {PAID_USE}: " + " | ".join(f"{prov['command']} ({spend_text(prov)})" for prov in paid)
+        )
     return "\n".join(lines), code
 
 
-def ai_guide(prefs):
+def ai_guide(prefs, now):
     lines = ["tokenwatch: AI agent guide", "",
              "Reports remaining subscription quota without using a model. It does not open sessions.",
              "Before delegation, run tokenwatch --best easy, medium or hard.",
@@ -670,8 +803,8 @@ def ai_guide(prefs):
     free = prefs.get("free") or {}
     if free.get("models"):
         lines.append(f"Free models: {', '.join(free['models'])}; {free.get('use') or 'limited use'}.")
-    for prov in read_opencode_paid():
-        lines.append(f"{prov['name']}: {PAID_NOTE} ({prov['command']}).")
+    for prov in read_opencode_paid(now, prefs):
+        lines.append(f"{prov['name']}: {paid_text(prov, now)} ({prov['command']}).")
     return "\n".join(lines)
 
 
@@ -686,7 +819,7 @@ def report(args, now):
 
     live = not args.local
     providers = read_claude(now) + read_codex(now, live) + read_agy(now) + read_opencode(now, live)
-    paid = read_opencode_paid()
+    paid = read_opencode_paid(now, load_prefs())
     if args.json:
         return json.dumps({"generated": now, "providers": providers, "pay_per_use": paid}, ensure_ascii=False)
     if not providers:
@@ -694,7 +827,7 @@ def report(args, now):
     providers = by_availability(providers)
     color = use_color(args)
     if args.verbose or args.live:
-        return "\n".join([table(providers, now, color)] + paid_lines(paid) + [short_line(providers, now, color)])
+        return "\n".join([table(providers, now, color)] + paid_lines(paid, now))
     return short_line(providers, now, color)
 
 
@@ -738,7 +871,7 @@ def main():
     args = parser.parse_args()
 
     if args.agent_guide:
-        print(ai_guide(load_prefs()))
+        print(ai_guide(load_prefs(), int(time.time())))
         return 0
     if args.best is not None:
         text, code = best_report(args, int(time.time()))

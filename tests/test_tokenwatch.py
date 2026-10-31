@@ -2,6 +2,7 @@ import ast
 import copy
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -54,6 +55,21 @@ class QuotaTests(unittest.TestCase):
         self.assertEqual([p['name'] for p in ranked], ['opencode-go', 'opencode-go-2'])
         self.assertEqual(len(discarded), 3)
 
+    def test_unstarted_five_hour_window_hides_reset(self):
+        now = 1000
+        idle = {'name': 'codex', 'five_hour': app.window(100, now + 5 * 3600, now, now), 'week': None}
+        used = {'name': 'claude', 'five_hour': app.window(100, now + 3 * 3600, now, now), 'week': None}
+        rows = app.table([idle, used], now).split('\n')
+        self.assertEqual(rows[1].split()[1:4], ['100%', '-', '-'])
+        self.assertNotEqual(rows[2].split()[2], '-')
+
+    def test_table_marks_only_exhausted_window_red(self):
+        line = app.table([self.provider('opencode-go', 100, 90, 0)], 1000, color=True).split('\n')[1]
+        red, gray = '\033[31m', '\033[38;5;242m'
+        self.assertIn(red + '0%', line)
+        self.assertIn(gray + '90%', line)
+        self.assertIn(gray + '100%', line)
+
     def test_unknown_quota_returns_exit_one(self):
         args = type('Args', (), {'local': True, 'best': 'easy', 'json': True})()
         with patch.object(app, 'read_claude', return_value=[self.provider('claude', None)]), \
@@ -91,6 +107,25 @@ class QuotaTests(unittest.TestCase):
             self.assertEqual(rows[0]['name'], 'opencode-go')
             self.assertIsNone(rows[0]['five_hour'])
 
+    def test_opencode_expired_key_is_reported_and_excluded(self):
+        body = io.BytesIO(json.dumps({'error': {'code': 'api_key_expired'}}).encode())
+        expired = app.urllib.error.HTTPError(app.OPENCODE_USAGE_URL, 401, 'Unauthorized', {}, body)
+        with tempfile.TemporaryDirectory() as home:
+            auth = Path(home) / 'auth.json'
+            auth.write_text(json.dumps({'opencode-go-2': {'type': 'api', 'key': 'synthetic-test-key'}}))
+            cache = Path(home) / 'opencode.json'
+            cache.write_text(json.dumps({'opencode-go-2': {'seen_at': 1, 'usage': {'weekly': {'percent': 10}}}}))
+            with patch.object(app, 'OPENCODE_AUTH', str(auth)), patch.object(app, 'CACHE_DIR', home), \
+                 patch.object(app.urllib.request, 'urlopen', side_effect=expired):
+                rows = app.read_opencode(100000)
+            with patch.object(app, 'OPENCODE_AUTH', str(auth)), patch.object(app, 'CACHE_DIR', home):
+                self.assertEqual(app.read_opencode(100000, live=False)[0]['error'], 'key expired')
+        self.assertEqual(rows[0]['error'], 'key expired')
+        self.assertIsNone(rows[0]['week'])
+        ranked, discarded = app.recommend(rows, 'easy', copy.deepcopy(app.DEFAULT_PREFS), 100000)
+        self.assertEqual(ranked, [])
+        self.assertIn('key expired', discarded[0]['reason'])
+
     def test_opencode_paid_lists_api_keys_only(self):
         with tempfile.TemporaryDirectory() as home:
             auth = Path(home) / 'auth.json'
@@ -98,10 +133,45 @@ class QuotaTests(unittest.TestCase):
                                         'anthropic': {'type': 'api', 'key': 'synthetic-test-key'},
                                         'openai': {'type': 'oauth', 'access': 'synthetic-token'},
                                         'empty': {'type': 'api', 'key': ''}}))
-            with patch.object(app, 'OPENCODE_AUTH', str(auth)):
-                paid = app.read_opencode_paid()
-        self.assertEqual(paid, [{'name': 'opencode-anthropic', 'command': 'opencode -m anthropic/<model>'}])
-        self.assertNotIn('synthetic', json.dumps(paid))
+            with patch.object(app, 'OPENCODE_AUTH', str(auth)), patch.object(app, 'CACHE_DIR', home), \
+                 patch.object(app, 'OPENCODE_DB', str(Path(home) / 'missing.db')):
+                paid = app.read_opencode_paid(1000, copy.deepcopy(app.DEFAULT_PREFS))
+                cached = (Path(home) / 'paid.json').read_text()
+        self.assertEqual([(p['name'], p['command']) for p in paid], [('opencode-anthropic', 'opencode -m anthropic/<model>')])
+        self.assertIsNone(paid[0]['spent'])
+        self.assertIn('spend unknown', app.paid_text(paid[0], 1000))
+        self.assertNotIn('synthetic', json.dumps(paid) + cached)
+
+    def test_opencode_paid_spend_budget_and_resets(self):
+        def message(provider, role, cost, at):
+            return (json.dumps({'providerID': provider, 'role': role, 'cost': cost}), at * 1000)
+
+        with tempfile.TemporaryDirectory() as home:
+            auth = Path(home) / 'auth.json'
+            auth.write_text(json.dumps({'anthropic': {'type': 'api', 'key': 'synthetic-test-key'}}))
+            db = app.sqlite3.connect(Path(home) / 'opencode.db')
+            db.execute('CREATE TABLE message (data text, time_created integer)')
+            db.executemany('INSERT INTO message VALUES (?, ?)', [
+                message('anthropic', 'assistant', 1.0, 100), message('anthropic', 'assistant', 2.0, 400),
+                message('anthropic', 'user', 5.0, 400), message('opencode-go', 'assistant', 9.0, 400)])
+            db.commit()
+            db.close()
+            prefs = copy.deepcopy(app.DEFAULT_PREFS)
+            prefs['providers']['opencode-anthropic'] = {'budget_usd': 10}
+            with patch.object(app, 'OPENCODE_AUTH', str(auth)), patch.object(app, 'CACHE_DIR', home), \
+                 patch.object(app, 'OPENCODE_DB', str(Path(home) / 'opencode.db')):
+                whole = app.read_opencode_paid(1000, prefs)[0]
+                prefs['providers']['opencode-anthropic']['expires'] = app.datetime.fromtimestamp(300).isoformat()
+                expired = app.read_opencode_paid(1000, prefs)[0]
+                auth.write_text(json.dumps({'anthropic': {'type': 'api', 'key': 'synthetic-new-key'}}))
+                del prefs['providers']['opencode-anthropic']['expires']
+                replaced = app.read_opencode_paid(1000, prefs)[0]
+        self.assertEqual(whole['spent'], 3.0)
+        self.assertIn('$3.00 of $10 spent, $7.00 left', app.paid_text(whole, 1000))
+        self.assertEqual(expired['spent'], 2.0)
+        self.assertIn('key expired', app.paid_text(expired, 1000))
+        self.assertEqual(replaced['spent'], 0.0)
+        self.assertEqual(replaced['since'], 1000)
 
     def test_clone_refuses_existing_provider(self):
         model = {'id': 'example-model', 'api': {'url': 'https://opencode.ai/zen/go/v1', 'npm': '@ai-sdk/openai-compatible'}}

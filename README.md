@@ -49,7 +49,7 @@ Percentages show quota **remaining**. The full table includes five-hour, weekly,
 
 Rows sort by available five-hour quota, then weekly quota. Providers with weekly or monthly quota below 5% sort below usable providers, by reset time. Unknown readings come last. JSON uses a fixed provider order.
 
-Five-hour colors: green at 60%+, yellow at 30%+, orange at 10%+, red below 10%. A red row with a crossed-out name indicates a weekly/monthly block. Provider name colors identify providers. Colors require a terminal unless `--color` is used; `--no-color` and `NO_COLOR` disable automatic colors. JSON never includes colors. `--live` uses an alternate terminal screen and restores it on Ctrl+C.
+Five-hour colors: green at 60%+, yellow at 30%+, orange at 10%+, red below 10%. A crossed-out red name indicates a weekly/monthly block: only the exhausted window is red and the rest of the row is gray. Expired or rejected OpenCode keys appear as red rows. In the table, an unused five-hour window shows `-` for its reset. Provider name colors identify providers. Colors require a terminal unless `--color` is used; `--no-color` and `NO_COLOR` disable automatic colors. JSON never includes colors. `--live` uses an alternate terminal screen and restores it on Ctrl+C.
 
 ## Recommendations and preferences
 
@@ -70,6 +70,8 @@ The example is generic; choose model IDs supported by your installed tools and p
 | `providers.NAME.notes` | Conditions or notes by level |
 | `providers.NAME.emergency_only` | Reserve for when regular providers lack quota |
 | `providers.NAME.avoid` | Model IDs prohibited in the agent guide |
+| `providers.opencode-ID.budget_usd` | Dollar budget for a pay-per-use OpenCode key; shows what is left |
+| `providers.opencode-ID.expires` | Expiry date of that key (`YYYY-MM-DD`); its spend counts from zero once it passes |
 | `free` | Unmetered model IDs and permitted use |
 
 Add this to your agents' global instructions if desired:
@@ -89,12 +91,20 @@ This helper changes OpenCode configuration only when explicitly run. It backs up
 
 Other providers connected in OpenCode with an API key (for example `anthropic`) are pay per use and have no quota windows. They appear as an informational `opencode-<id>` line in `-v`, `--best`, `--agent-guide` and as `pay_per_use` in `--json`, and are never recommended automatically.
 
+That line shows the dollars OpenCode recorded for the key, and what is left of `budget_usd` when set:
+
+```json
+"providers": {"opencode-anthropic": {"budget_usd": 100, "expires": "2026-11-19"}}
+```
+
+The first key seen counts OpenCode's whole history for that provider. Replacing the key restarts the count from that moment, and a passed `expires` restarts it from that date and marks the key as expired. Provider APIs do not report a normal key's expiry, so set `expires` from the provider's console. Spend is OpenCode's own estimate and excludes use of the same key outside OpenCode.
+
 ## Sources, privacy and limitations
 
 - Claude Code: limits received by its status line, saved in `~/.cache/tokenwatch/claude.json`.
 - agy: quota received by its status line, saved in `~/.cache/tokenwatch/agy.json`.
 - Codex: `codex app-server` reads account limits; falls back to the latest local session readings and cached results.
-- OpenCode pay-per-use providers: only the provider IDs and key type are read from the same auth file; the keys are neither read into output nor sent anywhere.
+- OpenCode pay-per-use providers: provider IDs and key type come from the same auth file; the keys are neither printed nor sent anywhere. A 16-character SHA-256 fingerprint in `~/.cache/tokenwatch/paid.json` detects a replaced key. Spend is summed read-only from message costs in OpenCode's local `opencode.db`.
 - OpenCode Go: reads connected keys from the local OpenCode auth file and sends each key only to `https://opencode.ai/zen/go/v1/usage`. This endpoint is undocumented and may change.
 
 No telemetry or third-party analytics are included. Credentials are not printed or copied into the repository. Codex uses its existing signed-in session. Cached quota responses stay on your machine. Live queries have a six-second timeout and are reused for 60 seconds. `--local` skips live queries. Claude/agy readings can be stale; API-key billing may not expose subscription windows. Provider protocol changes may require updates.
